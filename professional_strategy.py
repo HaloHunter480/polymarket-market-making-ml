@@ -34,6 +34,7 @@ Expected Performance (REALISTIC, with all protections):
 
 import asyncio
 import json
+import math
 import time
 import pickle
 import random
@@ -80,8 +81,8 @@ CANCEL_ALL_DELAY = 1.0         # Wait 1s after toxic flow before re-quoting
 MAX_SKEW = 0.04               # Max 4% skew from fair value
 FLOW_PRESSURE_WINDOW = 30     # 30 seconds of flow history
 
-# Position limits
-KELLY_FRACTION = 0.08         # 8% of Kelly (very conservative)
+# Position limits (v5: dynamic MC Kelly — these are now fallback caps only)
+KELLY_FRACTION = 0.08         # fallback fraction when MC Kelly unavailable
 MAX_BET_SIZE = 30.0
 MIN_BET_SIZE = 4.0
 BANKROLL = 500.0
@@ -91,9 +92,479 @@ SIGNAL_COOLDOWN = 25.0
 # Model parameters
 MIN_SAMPLES = 20
 
+# ── v5 Research Module Parameters ──────────────────────────────────────────
+KELLY_MC_SAMPLES     = 5000   # Monte Carlo posterior draws
+KELLY_CONFIDENCE_PCT = 25     # Use 25th percentile (conservative)
+MAX_KELLY_FRACTION   = 0.15   # Hard cap at 15% of bankroll
+CALIBRATION_GAMMA    = 1.08   # Favourite-longshot bias γ
+OFI_WEIGHT           = 0.15   # OFI edge-boost weight
+OFI_WINDOW           = 60     # Ticks in OFI rolling window
+REGIME_VOL_SCALE     = {"trending": 1.0, "mean_reverting": 1.15,
+                        "volatile": 0.70, "neutral": 1.0, "unknown": 0.85}
+MAX_RUIN_PROB        = 0.20   # Skip trade if simulated P(ruin) > 20%
+MC_EQUITY_PATHS      = 1000   # Paths in equity simulator
+
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+# ─── v5 Research Modules ──────────────────────────────────────────────────────
+
+class CalibrationCurve:
+    """Power-model calibration with rolling out-of-sample (OOS) γ fitting.
+
+    Architecture — walk-forward expanding window:
+        observations arrive in order: o_1, o_2, ..., o_T
+
+        After every FOLD_SIZE new observations:
+          train  = all observations BEFORE the current fold
+          val    = current fold  (OOS — never seen during fitting)
+
+        γ is chosen by MLE on train, then checked on val (log-loss).
+        The applied γ is always the one validated out-of-sample.
+        We never fit on val data → no in-sample bias.
+
+        Until we have enough data the prior γ = CALIBRATION_GAMMA is kept.
+    """
+
+    FOLD_SIZE  = 10
+    MIN_TRAIN  = 20
+    GAMMA_GRID = [g / 100.0 for g in range(90, 131)]
+
+    def __init__(self, gamma: float = CALIBRATION_GAMMA):
+        self._gamma   = gamma
+        self._all: list = []
+        self._oos_log: list = []   # [(fold_id, train_n, val_ll, gamma)]
+
+    def calibrate(self, market_price: float) -> float:
+        p  = max(0.01, min(0.99, market_price))
+        g  = self._gamma
+        pp = p ** (1.0 / g)
+        qp = (1.0 - p) ** (1.0 / g)
+        d  = pp + qp
+        return pp / d if d > 1e-10 else p
+
+    def record_outcome(self, market_price: float, won: bool):
+        self._all.append((market_price, 1 if won else 0))
+        n = len(self._all)
+        if n >= self.MIN_TRAIN + self.FOLD_SIZE and n % self.FOLD_SIZE == 0:
+            self._rolling_oos_fit()
+
+    def oos_summary(self) -> dict:
+        if not self._oos_log:
+            return {"folds": 0, "gamma": self._gamma}
+        avg_val_ll = sum(r[2] for r in self._oos_log) / len(self._oos_log)
+        return {
+            "folds":        len(self._oos_log),
+            "gamma":        round(self._gamma, 3),
+            "avg_val_ll":   round(avg_val_ll, 4),
+            "last_train_n": self._oos_log[-1][1],
+        }
+
+    @staticmethod
+    def _ll(data: list, g: float) -> float:
+        ll = 0.0
+        for mp, outcome in data:
+            p   = max(0.01, min(0.99, mp))
+            pp  = p ** (1.0 / g)
+            cal = pp / (pp + (1.0 - p) ** (1.0 / g))
+            ll += math.log(max(1e-10, cal if outcome else 1.0 - cal))
+        return ll
+
+    def _rolling_oos_fit(self):
+        val_data   = self._all[-self.FOLD_SIZE:]
+        train_data = self._all[:-self.FOLD_SIZE]
+        if len(train_data) < self.MIN_TRAIN:
+            return
+        best_g, best_tll = self._gamma, float("-inf")
+        for g in self.GAMMA_GRID:
+            tll = self._ll(train_data, g)
+            if tll > best_tll:
+                best_tll = tll
+                best_g   = g
+        val_ll = self._ll(val_data, best_g)
+        self._oos_log.append((len(self._oos_log) + 1,
+                               len(train_data),
+                               round(val_ll, 4),
+                               best_g))
+        self._gamma = best_g
+
+
+class MonteCarloKelly:
+    """Full 3-dimensional MC Kelly — no loose ends.
+
+    Three independent sources of uncertainty are resampled per path:
+
+    Dimension 1 — Win-probability uncertainty (both order types)
+        p_s ~ Beta(α, β)
+        α = p̂·n,  β = (1-p̂)·n
+        When n is small the Beta is wide → conservative sizing automatically.
+
+    Dimension 2 — Entry-price / slippage uncertainty (taker orders)
+        slip_s ~ clip(Normal(μ_slip, σ_slip), 0, ∞)
+        effective_price_s = price · (1 + slip_s)
+        R_s = (1 - fee) / effective_price_s - 1   ← payout ratio varies per path
+
+    Dimension 3 — Fill-rate uncertainty (maker orders)
+        fill_s ~ Beta(fα, fβ)
+        fα = fill_rate · n_fill_obs,  fβ = (1-fill_rate) · n_fill_obs
+        The 3-outcome Kelly derivation (win / lose / no-fill) shows that
+        the optimal f* is independent of fill_rate in expectation, but
+        fill-rate *uncertainty* inflates variance across paths.  We multiply
+        f_s by fill_s so that the 25th-percentile cut automatically penalises
+        paths where both luck and fill rate are unfavourable simultaneously.
+
+    Final size = Quantile_{25}(f_s) × bankroll, capped at MAX_BET_SIZE.
+    """
+
+    @staticmethod
+    def compute(
+        prob: float,
+        price: float,
+        n_samples: int,
+        bankroll: float,
+        fee: float = TAKER_FEE,
+        execution_type: str = "TAKER",
+        slippage_mu: float = None,      # defaults per execution_type
+        slippage_sigma: float = None,   # defaults to 30% of slippage_mu
+        maker_fill_rate: float = MAKER_FILL_RATE,
+        maker_fill_n: int = 50,         # prior strength for fill-rate posterior
+        n_mc: int = KELLY_MC_SAMPLES,
+    ) -> tuple:
+        if price <= 0.01 or price >= 0.99:
+            return 0.0, {"reason": "price_extreme"}
+
+        # ── Slippage defaults ──────────────────────────────────────────────
+        if slippage_mu is None:
+            slippage_mu = TAKER_SLIPPAGE if execution_type == "TAKER" else 0.003
+        if slippage_sigma is None:
+            slippage_sigma = max(0.001, slippage_mu * 0.30)
+
+        # ── Dimension 1: win-probability posterior ─────────────────────────
+        alpha  = max(1.0, prob * n_samples)
+        beta_p = max(1.0, (1.0 - prob) * n_samples)
+
+        # ── Dimension 3: maker fill-rate posterior ─────────────────────────
+        fill_alpha = max(1.0, maker_fill_rate * maker_fill_n)
+        fill_beta  = max(1.0, (1.0 - maker_fill_rate) * maker_fill_n)
+
+        fractions = []
+        for _ in range(n_mc):
+
+            # 1. Sample win probability
+            p_s = random.betavariate(alpha, beta_p)
+
+            # 2. Sample slippage → effective entry price → payout ratio R_s
+            slip_s      = max(0.0, random.gauss(slippage_mu, slippage_sigma))
+            eff_price_s = min(0.98, price * (1.0 + slip_s))
+            R_s         = (1.0 - fee) / eff_price_s - 1.0
+            if R_s <= 0.0:
+                fractions.append(0.0)
+                continue
+
+            # 3. Kelly fraction for this (p_s, R_s) draw
+            q_s = 1.0 - p_s
+            f_s = (p_s * R_s - q_s) / R_s
+            f_s = max(0.0, f_s)
+
+            # 4. For MAKER: scale by sampled fill probability
+            #    3-outcome Kelly (win/lose/no-fill) gives f* independent of
+            #    fill_rate in expectation, but fill-rate uncertainty inflates
+            #    cross-path variance.  Multiplying by fill_s ensures the
+            #    25th-pctile cut penalises adverse (low fill + bad luck) jointly.
+            if execution_type == "MAKER":
+                fill_s = random.betavariate(fill_alpha, fill_beta)
+                f_s    = f_s * fill_s
+
+            fractions.append(f_s)
+
+        fractions.sort()
+        idx      = max(0, int(len(fractions) * KELLY_CONFIDENCE_PCT / 100))
+        f_cons   = fractions[idx]
+        f_median = fractions[len(fractions) // 2]
+        f_capped = min(f_cons, MAX_KELLY_FRACTION)
+        trade_usd = round(min(f_capped * bankroll, MAX_BET_SIZE), 2)
+
+        return trade_usd, {
+            "kelly_25pct":  round(f_cons, 4),
+            "kelly_median": round(f_median, 4),
+            "kelly_capped": round(f_capped, 4),
+            "alpha":        round(alpha, 1),
+            "beta":         round(beta_p, 1),
+            "slip_mu":      round(slippage_mu, 4),
+            "exec_type":    execution_type,
+        }
+
+
+class EquitySimulator:
+    """Full forward equity simulation — all risk metrics computed per path.
+
+    Per path, the simulation records:
+      - Final equity
+      - Maximum drawdown  (peak-to-trough in dollar and % terms)
+      - Loss streak       (longest consecutive losing trades)
+      - Time under water  (number of trades where equity < starting bankroll)
+
+    Aggregated statistics returned:
+      p_ruin              P(final equity < min_trade)
+      median_final        50th pct of final equity
+      ci_5 / ci_95        5th / 95th pct of final equity
+      e_return            mean final equity - bankroll
+      dd_mean             mean max drawdown ($)
+      dd_p95              95th pct max drawdown (worst-5% of paths)
+      dd_p99              99th pct max drawdown
+      dd_pct_mean         mean max drawdown as % of bankroll
+      dd_pct_p95          95th pct max drawdown %
+      streak_mean         mean longest loss streak
+      streak_p95          95th pct longest loss streak
+      streak_dist         {length: count} loss-streak frequency distribution
+      tuw_mean            mean time-under-water (number of trades)
+      tuw_p95             95th pct time-under-water
+      tuw_pct_mean        mean time-under-water as fraction of n_trades
+    """
+
+    @staticmethod
+    def simulate(bankroll: float, n_trades: int, prob: float,
+                 price: float, kelly_frac: float,
+                 n_paths: int = MC_EQUITY_PATHS) -> dict:
+        if n_trades <= 0 or bankroll < MIN_BET_SIZE:
+            return {"p_ruin": 0.0, "median_final": bankroll}
+
+        finals      = []
+        max_dds     = []
+        max_dd_pcts = []
+        streaks     = []
+        tuws        = []
+        streak_counts: dict = {}
+
+        for _ in range(n_paths):
+            eq         = bankroll
+            peak       = bankroll
+            max_dd     = 0.0
+            cur_streak = 0
+            max_streak = 0
+            tuw        = 0
+
+            for _ in range(n_trades):
+                if eq < MIN_BET_SIZE:
+                    break
+                bet = min(eq * kelly_frac, MAX_BET_SIZE)
+
+                if random.random() < prob:
+                    eq        += bet / price - bet
+                    peak       = max(peak, eq)
+                    cur_streak = 0
+                else:
+                    eq        -= bet
+                    cur_streak += 1
+                    max_streak  = max(max_streak, cur_streak)
+
+                dd = peak - eq
+                if dd > max_dd:
+                    max_dd = dd
+
+                if eq < bankroll:
+                    tuw += 1
+
+            finals.append(eq)
+            max_dds.append(max_dd)
+            max_dd_pcts.append(max_dd / bankroll if bankroll > 0 else 0.0)
+            streaks.append(max_streak)
+            tuws.append(tuw)
+            streak_counts[max_streak] = streak_counts.get(max_streak, 0) + 1
+
+        n = len(finals)
+        finals.sort()
+        max_dds.sort()
+        max_dd_pcts.sort()
+        streaks_s = sorted(streaks)
+        tuws_s    = sorted(tuws)
+
+        return {
+            "p_ruin":       sum(1 for x in finals if x < MIN_BET_SIZE) / n,
+            "median_final": finals[n // 2],
+            "ci_5":         finals[max(0, int(n * 0.05))],
+            "ci_95":        finals[min(n - 1, int(n * 0.95))],
+            "e_return":     sum(finals) / n - bankroll,
+            "dd_mean":      sum(max_dds) / n,
+            "dd_p95":       max_dds[min(n - 1, int(n * 0.95))],
+            "dd_p99":       max_dds[min(n - 1, int(n * 0.99))],
+            "dd_pct_mean":  sum(max_dd_pcts) / n,
+            "dd_pct_p95":   max_dd_pcts[min(n - 1, int(n * 0.95))],
+            "streak_mean":  sum(streaks) / n,
+            "streak_p95":   streaks_s[min(n - 1, int(n * 0.95))],
+            "streak_dist":  streak_counts,
+            "tuw_mean":     sum(tuws) / n,
+            "tuw_p95":      tuws_s[min(n - 1, int(n * 0.95))],
+            "tuw_pct_mean": sum(tuws) / n / max(n_trades, 1),
+        }
+
+
+class OFITracker:
+    """True OFI (Cont-Kukanov-Stoikov) with per-increment Z-score normalisation
+    and spread-regime gating.
+
+    Fix 1 — normalisation:
+        OLD: z = Σ(ofi_i) / (std(ofi) * √n)
+             Problem: autocorrelated OFI increments make std(ofi)*√n
+             underestimate the true SE → inflated signal.
+        NEW: z_i = (ofi_i − μ_rolling) / σ_rolling  per increment
+             signal = tanh( Σ(z_i) / √W )
+             Each increment is standardised independently before accumulation.
+
+    Fix 2 — spread-regime gate:
+        When spreads compress, market makers have consensus on fair value and
+        OFI no longer conveys exploitable information.
+        spread_weight = clip( (spread − S_min) / (S_ref − S_min), 0, 1 )
+        Final signal  = raw_signal × spread_weight → 0 as spread → S_min
+    """
+
+    SPREAD_MIN = 0.01
+    SPREAD_REF = 0.04
+
+    def __init__(self, window: int = OFI_WINDOW, z_warmup: int = 10):
+        self._prev: Optional[dict] = None
+        self._raw_ofi: deque = deque(maxlen=window)
+        self._z_scores: deque = deque(maxlen=window)
+        self._z_warmup = z_warmup
+        self._last_spread: float = 0.0
+
+    def update(self, book: dict):
+        if self._prev is None:
+            self._prev = dict(book)
+            self._last_spread = book.get("spread", 0.0)
+            return
+
+        bid_d = book.get("tob_bid_vol", 0) - self._prev.get("tob_bid_vol", 0)
+        ask_d = book.get("tob_ask_vol", 0) - self._prev.get("tob_ask_vol", 0)
+        ofi   = bid_d - ask_d
+        if book.get("best_bid", 0) > self._prev.get("best_bid", 0):
+            ofi += book.get("tob_bid_vol", 0)
+        if book.get("best_ask", 0) < self._prev.get("best_ask", 0):
+            ofi -= book.get("tob_ask_vol", 0)
+
+        self._raw_ofi.append(ofi)
+        self._last_spread = book.get("spread", 0.0)
+
+        n = len(self._raw_ofi)
+        if n >= self._z_warmup:
+            hist = list(self._raw_ofi)[:-1]
+            mu   = sum(hist) / len(hist)
+            var  = sum((v - mu) ** 2 for v in hist) / len(hist)
+            sig  = var ** 0.5
+            z_i  = (ofi - mu) / sig if sig > 1e-8 else 0.0
+        else:
+            z_i = 0.0
+
+        self._z_scores.append(z_i)
+        self._prev = dict(book)
+
+    def signal(self) -> float:
+        if len(self._z_scores) < 3:
+            return 0.0
+        zs      = list(self._z_scores)
+        cum_z   = sum(zs) / (len(zs) ** 0.5)
+        raw_sig = math.tanh(cum_z / 3.0)
+
+        s = self._last_spread
+        if s <= self.SPREAD_MIN:
+            return 0.0
+        weight = min(1.0, (s - self.SPREAD_MIN)
+                     / (self.SPREAD_REF - self.SPREAD_MIN))
+        return raw_sig * weight
+
+    def spread_weight(self) -> float:
+        s = self._last_spread
+        if s <= self.SPREAD_MIN:
+            return 0.0
+        return min(1.0, (s - self.SPREAD_MIN)
+                   / (self.SPREAD_REF - self.SPREAD_MIN))
+
+    def reset(self):
+        self._prev = None
+        self._raw_ofi.clear()
+        self._z_scores.clear()
+        self._last_spread = 0.0
+
+
+class RegimeClassifier:
+    """EWMA volatility + directional momentum regime classifier.
+
+    Replaces Hurst exponent (R/S) which requires 256+ samples for reliable
+    estimation and has upward bias on short windows.  Both new signals are
+    reliable from as few as 10 ticks.
+
+    Signal 1 — EWMA Realized Volatility (RiskMetrics, λ=0.94)
+        σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
+        Responds within ~10 ticks; compared to a rolling baseline to
+        determine whether current vol is LOW / MEDIUM / HIGH.
+
+    Signal 2 — Directional Momentum Score
+        M = Σ sign(r_i) / n  ∈ [-1, +1]
+        "Trending" only declared when |M| exceeds the 95% binomial noise
+        band: 2/√n.  Below that it is statistically indistinguishable from
+        a coin-flip — no trend label is assigned.
+
+    Regime → Kelly scale:
+        trending      ×1.00  (momentum strategy has edge)
+        mean_reverting×1.15  (binary resolution favours reversion)
+        volatile      ×0.70  (wider tails → reduce exposure)
+        neutral       ×1.00
+        unknown       ×0.85  (insufficient data → caution)
+    """
+
+    EWMA_LAMBDA   = 0.94
+    VOL_HIGH_MULT = 1.8
+    VOL_LOW_MULT  = 0.6
+    MIN_RETURNS   = 10
+
+    @staticmethod
+    def classify(prices) -> tuple:
+        arr = list(prices)
+        if len(arr) < RegimeClassifier.MIN_RETURNS + 1:
+            return "unknown", {}
+
+        rets = [(arr[i+1] - arr[i]) / arr[i]
+                for i in range(len(arr) - 1) if arr[i] != 0]
+        n = len(rets)
+        if n < RegimeClassifier.MIN_RETURNS:
+            return "unknown", {}
+
+        # ── Signal 1: EWMA Realized Volatility ──────────────────────────
+        lam    = RegimeClassifier.EWMA_LAMBDA
+        var_ew = rets[0] ** 2
+        for r in rets[1:]:
+            var_ew = lam * var_ew + (1.0 - lam) * r ** 2
+        vol_ewma = var_ew ** 0.5
+
+        mean_r   = sum(rets) / n
+        var_base = sum((r - mean_r) ** 2 for r in rets) / n
+        vol_base = var_base ** 0.5
+
+        vol_ratio = (vol_ewma / vol_base) if vol_base > 1e-12 else 1.0
+
+        # ── Signal 2: Directional Momentum Score ────────────────────────
+        momentum   = sum(1.0 if r > 0 else -1.0 for r in rets) / n
+        noise_band = 2.0 / (n ** 0.5)
+        trending   = abs(momentum) > noise_band
+
+        stats_d = {
+            "vol_ewma":   round(vol_ewma, 7),
+            "vol_base":   round(vol_base, 7),
+            "vol_ratio":  round(vol_ratio, 3),
+            "momentum":   round(momentum, 3),
+            "noise_band": round(noise_band, 3),
+            "n":          n,
+        }
+
+        if vol_ratio > RegimeClassifier.VOL_HIGH_MULT:
+            return "volatile", stats_d
+        if trending:
+            return "trending", stats_d
+        if vol_ratio < RegimeClassifier.VOL_LOW_MULT:
+            return "mean_reverting", stats_d
+        return "neutral", stats_d
 
 
 # ─── Advanced Models ──────────────────────────────────────────────────────────
@@ -998,166 +1469,198 @@ class ProfessionalExecutor:
 # ─── Advanced Signal Generator ────────────────────────────────────────────────
 
 class AdvancedSignalGenerator:
-    """Generate signals using all advanced models."""
-    
-    def __init__(self, empirical: EmpiricalEngine, feed: EnhancedMultiExchangeFeed):
-        self.empirical = empirical
-        self.feed = feed
-    
+    """Generate signals using all advanced models (v5 research-grade)."""
+
+    def __init__(self, empirical: EmpiricalEngine,
+                 feed: "EnhancedMultiExchangeFeed",
+                 bankroll: float = BANKROLL):
+        self.empirical   = empirical
+        self.feed        = feed
+        self.bankroll    = bankroll
+        # v5 modules
+        self.calibration = CalibrationCurve()
+        self.ofi         = OFITracker(window=OFI_WINDOW)
+        self._prices_for_regime: deque = deque(maxlen=120)
+
+    def update_price(self, price: float):
+        """Call from strategy loop on each BTC tick."""
+        self._prices_for_regime.append(price)
+
+    def update_book(self, book_dict: dict):
+        """Feed raw book dict into OFI tracker."""
+        self.ofi.update(book_dict)
+
+    def record_outcome(self, market_price: float, won: bool):
+        """Online calibration update after each resolved trade."""
+        self.calibration.record_outcome(market_price, won)
+
+    def reset_window(self):
+        self.ofi.reset()
+
     def evaluate(
         self,
         btc_price: float,
         strike: float,
         time_remaining: float,
-        book: OrderBook,
+        book: "OrderBook",
+        book_dict: dict,
         window_open_time: float = 0.0,
-    ) -> Optional[TradeSignal]:
-        """
-        Generate trading signal with execution type.
-        
-        Includes order book reality checks:
-        1. Window initialization delay (15s)
-        2. Ghost town filter (min $50 TOB volume)
-        3. Maximum edge cap (15% for Kelly sizing)
-        """
-        
+    ) -> Optional["TradeSignal"]:
+        """Generate trading signal with all v5 research checks."""
+
         if strike <= 0 or btc_price <= 0 or time_remaining < 15:
             return None
-        
-        # REALITY CHECK #1: Window Initialization Delay
-        # Don't trade during first 15s of new window (empty book)
+
+        # ── Reality Check 1: window init delay ──
         if window_open_time > 0:
-            seconds_since_open = time.time() - window_open_time
-            if seconds_since_open < WINDOW_INIT_DELAY:
-                return None  # Wait for CLOB to populate
-        
-        # Check toxic flow
-        is_toxic, reason = self.feed.is_toxic_flow_active()
+            if time.time() - window_open_time < WINDOW_INIT_DELAY:
+                return None
+
+        # ── Toxic flow gate ──
+        is_toxic, _ = self.feed.is_toxic_flow_active()
         if is_toxic:
-            return None  # Don't generate signals during toxic flow
-        
-        # REALITY CHECK #2: Ghost Town Filter
-        # Check top-of-book volume before calculating edge
+            return None
+
+        # ── Reality Check 2: ghost-town filter ──
         if book.asks and book.bids:
-            best_ask_volume = book.asks[0].size * book.asks[0].price if book.asks[0].price > 0 else 0
-            best_bid_volume = book.bids[0].size * book.bids[0].price if book.bids[0].price > 0 else 0
-            
-            # Need at least $50 at TOB, otherwise it's a ghost town
-            if best_ask_volume < MIN_TOB_VOLUME and best_bid_volume < MIN_TOB_VOLUME:
-                return None  # Empty book, skip
-        
-        # Base empirical probability
+            ask_vol = book.asks[0].size * book.asks[0].price if book.asks[0].price > 0 else 0
+            bid_vol = book.bids[0].size * book.bids[0].price if book.bids[0].price > 0 else 0
+            if ask_vol < MIN_TOB_VOLUME and bid_vol < MIN_TOB_VOLUME:
+                return None
+
+        # ── Base empirical probability ──
         pct_diff = (btc_price - strike) / strike * 100
         emp_prob, sample_count = self.empirical.lookup(pct_diff, time_remaining)
-        
         if sample_count < MIN_SAMPLES:
             return None
-        
-        if sample_count < MIN_SAMPLES:
-            return None
-        
-        # Flow pressure adjustment
-        flow_skew = self.feed.flow_pressure.get_skew()
-        
-        # Adjust probability for flow
-        # Strong buy pressure = increase P(UP)
-        emp_prob_up = emp_prob + flow_skew
-        emp_prob_up = max(0.02, min(0.98, emp_prob_up))
+
+        # ── v5 #5: Regime classification ──
+        regime, regime_stats = RegimeClassifier.classify(self._prices_for_regime)
+        regime_scale = REGIME_VOL_SCALE.get(regime, 1.0)
+
+        # ── v5 #4: OFI ──
+        self.ofi.update(book_dict)
+        ofi_signal = self.ofi.signal()
+
+        # ── v5 #2: Calibration ──
+        cal_mid = self.calibration.calibrate(book.mid_price)
+
+        # Flow pressure (legacy, still useful)
+        flow_skew  = self.feed.flow_pressure.get_skew()
+        emp_prob_up = max(0.02, min(0.98, emp_prob + flow_skew))
         emp_prob_down = 1.0 - emp_prob_up
-        
-        # Market prices
-        market_up = book.mid_price
-        market_down = 1.0 - market_up
-        
-        # Calculate edges for both execution types
-        maker_edge_up = emp_prob_up - market_up - MAKER_FEE
+
+        market_up   = cal_mid          # calibrated P(UP)
+        market_down = 1.0 - cal_mid
+
+        # Model/market sanity check (prevent strike mismatch phantom edges)
+        if abs(emp_prob_up - cal_mid) > 0.25:
+            return None
+
+        # ── Edge calculation ──
+        maker_edge_up   = emp_prob_up   - market_up   - MAKER_FEE
         maker_edge_down = emp_prob_down - market_down - MAKER_FEE
-        taker_edge_up = emp_prob_up - market_up - TAKER_FEE
+        taker_edge_up   = emp_prob_up   - market_up   - TAKER_FEE
         taker_edge_down = emp_prob_down - market_down - TAKER_FEE
-        
-        # Decide execution type and side
-        side = None
-        fair_value = None
-        market_price = None
-        edge = None
-        execution_type = None
-        
-        # TAKER logic: ONLY if edge > 4.5% AND (time < 60s OR very strong edge)
+
+        # ── OFI confirmation gate + micro-boost ──
+        if abs(ofi_signal) > 0.2:
+            if ofi_signal < -0.3:   # selling pressure
+                taker_edge_up   -= 0.01
+                maker_edge_up   -= 0.01
+            elif ofi_signal > 0.3:  # buying pressure
+                taker_edge_down -= 0.01
+                maker_edge_down -= 0.01
+
+        # OFI edge boost when confirming
+        for edge_list in [(taker_edge_up, "UP"), (taker_edge_down, "DOWN")]:
+            pass  # applied below per-side
+
+        # ── Execution type decision ──
+        side = fair_value = market_price = edge = execution_type = None
+
+        # TAKER: strict 4.5% edge OR inside last 60 seconds
         if time_remaining < 60 or max(taker_edge_up, taker_edge_down) > 0.08:
             if taker_edge_up > MIN_TAKER_EDGE:
-                side = "UP"
-                fair_value = emp_prob_up
-                market_price = market_up
-                edge = taker_edge_up
-                execution_type = "TAKER"
+                # OFI boost
+                boost = (ofi_signal * OFI_WEIGHT * 0.05
+                         if ofi_signal > 0.2 else 0.0)
+                side, fair_value, market_price = "UP", emp_prob_up, market_up
+                edge, execution_type = taker_edge_up + boost, "TAKER"
             elif taker_edge_down > MIN_TAKER_EDGE:
-                side = "DOWN"
-                fair_value = emp_prob_down
-                market_price = market_down
-                edge = taker_edge_down
-                execution_type = "TAKER"
-        
-        # MAKER logic: if no taker opportunity and edge > 0.8%
-        if execution_type is None:
+                boost = (abs(ofi_signal) * OFI_WEIGHT * 0.05
+                         if ofi_signal < -0.2 else 0.0)
+                side, fair_value, market_price = "DOWN", emp_prob_down, market_down
+                edge, execution_type = taker_edge_down + boost, "TAKER"
+
+        # MAKER: 0.8% edge, spread not too wide, NOT in last 60 seconds
+        if execution_type is None and time_remaining > 60:
             if maker_edge_up > MIN_MAKER_EDGE and maker_edge_up > maker_edge_down:
-                side = "UP"
-                fair_value = emp_prob_up
-                market_price = market_up
-                edge = maker_edge_up
-                execution_type = "MAKER"
+                side, fair_value, market_price = "UP", emp_prob_up, market_up
+                edge, execution_type = maker_edge_up, "MAKER"
             elif maker_edge_down > MIN_MAKER_EDGE:
-                side = "DOWN"
-                fair_value = emp_prob_down
-                market_price = market_down
-                edge = maker_edge_down
-                execution_type = "MAKER"
-        
+                side, fair_value, market_price = "DOWN", emp_prob_down, market_down
+                edge, execution_type = maker_edge_down, "MAKER"
+
         if execution_type is None:
-            return None  # No opportunity
-        
-        # Check spread for maker orders
+            return None
+
         if execution_type == "MAKER" and book.spread_bps > MAX_SPREAD_BPS:
-            return None  # Spread too wide
-        
-        # Calculate limit price for maker orders
+            return None
+
+        # ── Reality Check 3: max-edge cap (phantom edge guard) ──
+        if abs(edge) > MAX_REALISTIC_EDGE:
+            return None
+
+        # ── Limit price for maker ──
         limit_price = None
         if execution_type == "MAKER":
             executor = ProfessionalExecutor(self.feed)
-            limit_price = executor.calculate_skewed_price(fair_value, side, flow_skew, book)
+            limit_price = executor.calculate_skewed_price(
+                fair_value, side, flow_skew, book)
             if limit_price is None:
                 return None
-        
-        # Confidence and Kelly sizing
+
+        # ── Confidence score ──
         sample_conf = min(1.0, sample_count / 50)
-        edge_conf = min(1.0, abs(edge) / 0.05)
+        edge_conf   = min(1.0, abs(edge) / 0.05)
         spread_conf = 1.0 - min(1.0, book.spread_bps / MAX_SPREAD_BPS)
-        toxic_risk = 1.0 if self.feed.time_since_toxic() > 10 else 0.5
-        
-        confidence = (
-            0.3 * sample_conf +
-            0.3 * edge_conf +
-            0.2 * spread_conf +
-            0.2 * toxic_risk
+        toxic_risk  = 1.0 if self.feed.time_since_toxic() > 10 else 0.5
+        confidence  = (0.3 * sample_conf + 0.3 * edge_conf
+                       + 0.2 * spread_conf + 0.2 * toxic_risk)
+
+        # ── v5 #1: Monte Carlo Kelly sizing (full 3-dimensional) ──
+        fee = TAKER_FEE if execution_type == "TAKER" else MAKER_FEE
+        mc_size, mc_detail = MonteCarloKelly.compute(
+            prob=max(0.02, min(0.98, fair_value)),
+            price=max(0.02, min(0.98, market_price)),
+            n_samples=sample_count,
+            bankroll=self.bankroll,
+            fee=fee,
+            execution_type=execution_type,      # dim 2 (slip) + dim 3 (fill) branch
+            maker_fill_rate=MAKER_FILL_RATE,    # 40% historical fill rate prior
         )
-        
-        # REALITY CHECK #3: Maximum Edge Cap
-        # Cap edge at 15% for Kelly sizing (prevents "betting the farm" on anomalies)
-        capped_edge = min(abs(edge), MAX_REALISTIC_EDGE)
-        
-        # Kelly sizing (using capped edge)
-        if market_price > 0.01 and market_price < 0.99:
-            odds = (1.0 / market_price) - 1
-            # Use capped edge for Kelly, but keep real edge for P&L tracking
-            kelly_pct = (min(fair_value + capped_edge, 0.98) * odds - (1 - fair_value)) / odds
-            kelly_pct = max(0, kelly_pct) * KELLY_FRACTION * confidence
-            kelly_size = kelly_pct * BANKROLL
-        else:
-            kelly_size = 0
-        
-        kelly_size = min(MAX_BET_SIZE, max(MIN_BET_SIZE, kelly_size))
-        if kelly_size < MIN_BET_SIZE:
-            return None
-        
+
+        # Regime scale
+        mc_size = round(mc_size * regime_scale, 2)
+        mc_size = min(MAX_BET_SIZE, max(MIN_BET_SIZE, mc_size))
+
+        # ── v5 #3: Equity simulation ruin check ──
+        kelly_frac = mc_detail.get("kelly_capped", 0.05)
+        eq_sim = EquitySimulator.simulate(
+            bankroll=self.bankroll,
+            n_trades=MAX_TRADES_PER_WINDOW * 3,
+            prob=max(0.02, min(0.98, fair_value)),
+            price=max(0.02, min(0.98, market_price)),
+            kelly_frac=kelly_frac,
+        )
+        if eq_sim["p_ruin"] > MAX_RUIN_PROB:
+            mc_size = round(mc_size * 0.5, 2)
+            if mc_size < MIN_BET_SIZE:
+                return None
+
+        kelly_size = mc_size
+
         return TradeSignal(
             side=side,
             fair_value=fair_value,
@@ -1254,12 +1757,17 @@ class ProfessionalStrategy:
     def __init__(self, bankroll: float = BANKROLL):
         self.bankroll = bankroll
         self.running = False
-        
+
         self.feed = EnhancedMultiExchangeFeed()
         self.empirical = EmpiricalEngine()
-        self.signal_gen = AdvancedSignalGenerator(self.empirical, self.feed)
+        self.signal_gen = AdvancedSignalGenerator(
+            self.empirical, self.feed, bankroll=bankroll)
         self.executor = ProfessionalExecutor(self.feed)
         self.tracker = PaperTracker()
+
+        # v5 regime tracker
+        self._current_regime: str = "unknown"
+        self._regime_stats: dict = {}
         
         self.strike: float = 0.0
         self.token_id_up: str = ""
@@ -1281,15 +1789,22 @@ class ProfessionalStrategy:
         self.start_time = time.time()
         
         print("=" * 90)
-        print("  PROFESSIONAL MARKET MAKING SYSTEM")
+        print("  PROFESSIONAL MARKET MAKING SYSTEM v5 — RESEARCH-GRADE")
         print("=" * 90)
-        print(f"  Execution:     HYBRID (Maker when safe, Taker when necessary)")
-        print(f"  Maker edge:    {MIN_MAKER_EDGE*100:.1f}% minimum | Fill rate: {MAKER_FILL_RATE*100:.0f}% (realistic)")
-        print(f"  Taker edge:    {MIN_TAKER_EDGE*100:.1f}% minimum (STRICT) | Slippage: {TAKER_SLIPPAGE*100:.1f}%")
+        print(f"  Execution:     HYBRID (Maker 60%+ of window | Taker last 60s / strong edge)")
+        print(f"  Maker edge:    {MIN_MAKER_EDGE*100:.1f}% min | Fill rate: {MAKER_FILL_RATE*100:.0f}% (adverse-selection adjusted)")
+        print(f"  Taker edge:    {MIN_TAKER_EDGE*100:.1f}% min (strict) | Slippage: {TAKER_SLIPPAGE*100:.1f}%")
         print(f"  Toxic flow:    Hawkes + VPIN + Price jumps")
-        print(f"  Quote skew:    Dynamic asymmetric based on order flow")
+        print(f"  Quote skew:    Dynamic asymmetric (flow pressure)")
         print(f"  Bankroll:      ${self.bankroll:,.0f}")
         print(f"  Fill sim:      REALISTIC (40% maker fills, 1.5% taker slippage)")
+        print(f"  ─── v5 Research Modules ───")
+        print(f"  [1] MC Kelly:       {KELLY_MC_SAMPLES} posterior samples, {KELLY_CONFIDENCE_PCT}th pctile")
+        print(f"  [2] Calibration:    FLB correction γ={CALIBRATION_GAMMA}")
+        print(f"  [3] Equity Sim:     {MC_EQUITY_PATHS} paths, P(ruin)<{MAX_RUIN_PROB:.0%}")
+        print(f"  [4] OFI:            window={OFI_WINDOW} ticks, weight={OFI_WEIGHT:.0%}")
+        print(f"  [5] Regime:         EWMA-Vol + Momentum (trending/mean-rev/volatile/neutral)")
+        print(f"  [6] Distribution:   Full variance/skew/CI in empirical engine")
         print("=" * 90)
         print()
         
@@ -1386,6 +1901,9 @@ class ProfessionalStrategy:
                     await asyncio.sleep(0.1)
                     continue
                 
+                # Feed BTC price into regime & signal-gen
+                self.signal_gen.update_price(btc)
+
                 # Window transition
                 if window_id != self._current_window_id:
                     old_window = self._current_window_id
@@ -1393,22 +1911,47 @@ class ProfessionalStrategy:
                         old_strike = self._window_strikes[old_window]
                         resolved_up = btc >= old_strike
                         self.tracker.resolve_window(old_window, resolved_up)
-                        n_trades = len([t for t in self.tracker.closed_trades if t.window_id == old_window])
+
+                        # v5: record outcome for online calibration update
+                        for t in self.tracker.closed_trades:
+                            if t.window_id == old_window:
+                                self.signal_gen.record_outcome(
+                                    t.entry_price,
+                                    (resolved_up and t.side == "UP")
+                                    or (not resolved_up and t.side == "DOWN"))
+
+                        n_trades = len([t for t in self.tracker.closed_trades
+                                        if t.window_id == old_window])
                         if n_trades > 0:
                             result = "UP" if resolved_up else "DOWN"
-                            print(f"\n  *** WINDOW RESOLVED: {result} | BTC ${btc:,.2f} vs Strike ${old_strike:,.2f} | P&L: ${self.tracker.total_pnl:+,.2f} ***")
-                    
+                            print(f"\n  *** WINDOW RESOLVED: {result} | "
+                                  f"BTC ${btc:,.2f} vs Strike ${old_strike:,.2f} | "
+                                  f"P&L: ${self.tracker.total_pnl:+,.2f} ***")
+
                     self._window_transitions_seen += 1
                     self._current_window_id = window_id
                     self.strike = btc
                     self._window_strikes[window_id] = btc
                     self._trades_this_window = 0
-                    self._window_open_time = time.time()  # Record window open time
-                    
+                    self._window_open_time = time.time()
+                    self.signal_gen.reset_window()   # reset OFI tracker
+
+                    # v5: classify regime at window open
+                    self._current_regime, self._regime_stats = \
+                        RegimeClassifier.classify(self.signal_gen._prices_for_regime)
+
+                    regime_icon = {"trending": "📈", "mean_reverting": "🔄",
+                                   "volatile": "⚡", "neutral": "➖",
+                                   "unknown": "❓"}.get(self._current_regime, "❓")
+
                     if self._window_transitions_seen == 1:
-                        print(f"\n  === FIRST CLEAN WINDOW | Strike: ${btc:,.2f} ===")
+                        print(f"\n  === FIRST CLEAN WINDOW | Strike: ${btc:,.2f} "
+                              f"| Regime: {regime_icon}{self._current_regime} ===")
                     else:
-                        print(f"\n  === NEW WINDOW | Strike: ${btc:,.2f} ===")
+                        print(f"\n  === NEW WINDOW | Strike: ${btc:,.2f} "
+                              f"| Regime: {regime_icon}{self._current_regime} "
+                              f"(vol_r={self._regime_stats.get('vol_ratio', '?')} "
+                              f"M={self._regime_stats.get('momentum', '?')}) ===")
                 
                 if self._current_window_id == 0:
                     self._current_window_id = window_id
@@ -1430,13 +1973,25 @@ class ProfessionalStrategy:
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Generate signal (with window_open_time for reality checks)
+                # Build book_dict for OFI tracker — spread is required for gate
+                book_dict_up = {
+                    "best_bid":    book_up.best_bid,
+                    "best_ask":    book_up.best_ask,
+                    "spread":      book_up.spread_bps,   # spread-regime gate
+                    "tob_bid_vol": (book_up.bids[0].size * book_up.bids[0].price
+                                    if book_up.bids else 0),
+                    "tob_ask_vol": (book_up.asks[0].size * book_up.asks[0].price
+                                    if book_up.asks else 0),
+                }
+
+                # Generate signal (with all v5 research modules)
                 signal = self.signal_gen.evaluate(
-                    btc, 
-                    self.strike, 
-                    time_remaining, 
+                    btc,
+                    self.strike,
+                    time_remaining,
                     book_up,
-                    window_open_time=self._window_open_time
+                    book_dict=book_dict_up,
+                    window_open_time=self._window_open_time,
                 )
                 
                 if signal:
@@ -1485,12 +2040,20 @@ class ProfessionalStrategy:
             maker_trades = sum(1 for t in self.tracker.closed_trades if t.execution_type == "MAKER")
             taker_trades = sum(1 for t in self.tracker.closed_trades if t.execution_type == "TAKER")
             
-            ts = time.strftime("%H:%M:%S")
-            toxic_str = "TOXIC!" if is_toxic else "clean"
+            regime_icon = {"trending": "📈", "mean_reverting": "🔄",
+                           "volatile": "⚡", "neutral": "➖",
+                           "unknown": "❓"}.get(self._current_regime, "❓")
+            ofi_val     = self.signal_gen.ofi.signal()
+            ofi_sw      = self.signal_gen.ofi.spread_weight()
+            cal_gamma   = self.signal_gen.calibration._gamma
+            ts          = time.strftime("%H:%M:%S")
+            toxic_str   = "TOXIC!" if is_toxic else "clean"
             print(
                 f"  {ts} | BTC ${btc:>10,.2f} | K ${self.strike:>10,.2f} | "
                 f"Diff {pct_diff:+.2f}% | "
-                f"Flow {flow_pressure:+.2f} | VPIN {vpin:.2f} | {toxic_str:>6} | "
+                f"Flow {flow_pressure:+.2f} | OFI {ofi_val:+.2f}(w={ofi_sw:.2f}) | "
+                f"VPIN {vpin:.2f} | {toxic_str:>6} | "
+                f"{regime_icon}{self._current_regime[:4]} | γ={cal_gamma:.3f} | "
                 f"W/L {wins}/{losses} | M/T {maker_trades}/{taker_trades} | "
                 f"P&L ${self.tracker.total_pnl:+,.2f}"
             )
@@ -1505,6 +2068,9 @@ class ProfessionalStrategy:
         print(f"  Ticks:          {self.feed.total_ticks:,}")
         print(f"  Toxic events:   {self.feed.toxic_events}")
         print(f"  Signals:        {self.signals_generated}")
+        cal = self.signal_gen.calibration.oos_summary()
+        print(f"  Calibration:    γ={cal['gamma']}  OOS folds={cal['folds']}"
+              + (f"  avg_val_ll={cal.get('avg_val_ll', 'n/a')}" if cal['folds'] else ""))
         print()
         
         if self.tracker.closed_trades:

@@ -32,7 +32,7 @@ import time
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from collections import deque
 from datetime import datetime
 
@@ -43,8 +43,11 @@ from py_clob_client.clob_types import (
     ApiCreds,
     OrderArgs,
     MarketOrderArgs,
+    OrderType,
     PartialCreateOrderOptions,
     BookParams,
+    BalanceAllowanceParams,
+    AssetType,
 )
 
 load_dotenv()
@@ -121,7 +124,7 @@ class RiskManager:
         max_position: float = 200.0,
         max_orders_per_window: int = 3,
         max_order_size: float = 100.0,
-        min_order_size: float = 1.0,
+        min_order_size: float = 1.00,  # Polymarket FOK minimum is $1
         max_daily_orders: int = 100,
         circuit_breaker_consecutive_losses: int = 5,
     ):
@@ -223,6 +226,10 @@ class RiskManager:
         else:
             self.consecutive_losses = 0
 
+    def close_position(self, cost: float):
+        """Reduce total exposure when a position closes."""
+        self.total_exposure = max(0.0, self.total_exposure - cost)
+
     def status(self) -> str:
         return (
             f"PnL: ${self.session_pnl:+.2f} | "
@@ -259,6 +266,9 @@ class LiveExecutor:
         self.connected = False
         self.address = ""
 
+        # Per-token metadata cache (avoids 3 HTTP lookups per order)
+        self._token_cache: Dict[str, dict] = {}
+
         # Metrics
         self.total_orders = 0
         self.successful_orders = 0
@@ -274,12 +284,28 @@ class LiveExecutor:
             return False
 
         try:
-            # Create client
-            self.client = ClobClient(
-                host="https://clob.polymarket.com",
-                key=HexBytes(self.private_key),
-                chain_id=137,  # Polygon mainnet
-            )
+            # Proxy wallet: Polymarket uses a proxy (Gnosis Safe). Without funder+signature_type
+            # you get "not enough balance / allowance" even with USDC in the proxy.
+            proxy = os.getenv("PROXY_ADDRESS", "") or os.getenv("POLY_PROXY_ADDRESS", "")
+            # 1=MagicLink/email proxy, 2=MetaMask/browser wallet. "invalid signature" = wrong type.
+            sig_type = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
+
+            if proxy:
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=HexBytes(self.private_key),
+                    chain_id=137,
+                    signature_type=sig_type,
+                    funder=proxy,
+                )
+                logger.info(f"Using proxy: {proxy[:12]}... sig_type={sig_type} (2=MetaMask, 1=MagicLink)")
+            else:
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=HexBytes(self.private_key),
+                    chain_id=137,
+                )
+                logger.warning("No PROXY_ADDRESS in .env — if you use Polymarket proxy, add it (run: python3 find_proxy.py)")
 
             # Set API credentials if available
             if self.api_key and self.api_secret and self.api_passphrase:
@@ -307,12 +333,21 @@ class LiveExecutor:
             self.address = account.address
             logger.info(f"Wallet: {self.address}")
 
-            # Check balance
+            # Check balance and ensure allowance is set (fixes "not enough balance/allowance")
             try:
-                balance = self.client.get_balance_allowance()
-                logger.info(f"Balance/Allowance: {balance}")
+                bal_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                result = self.client.get_balance_allowance(bal_params)
+                balance = result.get("balance", "0")
+                allowance = result.get("allowance", "0")
+                bal_usd = int(balance) / 1e6 if balance else 0
+                allow_usd = int(allowance) / 1e6 if allowance else 0
+                logger.info(f"Balance: ${bal_usd:.2f}  Allowance: ${allow_usd:.2f}")
+                if bal_usd > 0 and allow_usd < bal_usd * 0.5:
+                    logger.info("Setting USDC allowance for trading...")
+                    self.client.update_balance_allowance(bal_params)
+                    logger.info("Allowance updated")
             except Exception as e:
-                logger.warning(f"Could not fetch balance: {e}")
+                logger.warning(f"Could not fetch/set balance: {e}")
 
             self.connected = True
             logger.info("Connected to Polymarket CLOB")
@@ -390,6 +425,8 @@ class LiveExecutor:
 
             if size <= 0:
                 return TradeResult(success=False, error=f"Invalid size: {size}")
+            if size < 8:
+                return TradeResult(success=False, error=f"Polymarket requires minimum 8 shares, got {size}")
 
             logger.info(f"Placing order: {side} {size:.2f} @ {price:.3f} | token={token_id[:12]}...")
 
@@ -404,12 +441,34 @@ class LiveExecutor:
 
             options = PartialCreateOrderOptions(tick_size=self.tick_size)
 
-            # This call:
-            # 1. Creates the order struct
-            # 2. Signs it with EIP-712 using the private key
-            # 3. Submits to CLOB API with authentication
-            # 4. Returns the order response
-            response = self.client.create_and_post_order(order_args, options)
+            # Submit with retry on 429 (rate limit) or INSUFFICIENT_FUNDS (refresh allowance).
+            response = None
+            last_err = None
+            for attempt in range(4):
+                try:
+                    response = self.client.create_and_post_order(order_args, options)
+                    break
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e).lower()
+                    if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+                        wait_s = 2 ** attempt
+                        logger.warning(f"Rate limit (429) — retry in {wait_s}s (attempt {attempt + 1}/4)")
+                        time.sleep(wait_s)
+                    elif ("insufficient" in err_str or "allowance" in err_str or "balance" in err_str
+                          ) and attempt < 2:
+                        logger.warning(f"INSUFFICIENT_FUNDS/allowance — refreshing allowance (attempt {attempt + 1}/2)")
+                        try:
+                            bal_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                            self.client.update_balance_allowance(bal_params)
+                            time.sleep(1)
+                        except Exception as ae:
+                            logger.warning(f"Allowance refresh failed: {ae}")
+                        # retry order after allowance refresh
+                    else:
+                        raise
+            if response is None and last_err is not None:
+                raise last_err
 
             t_end = time.perf_counter_ns()
             latency_ms = (t_end - t_start) / 1e6
@@ -472,6 +531,34 @@ class LiveExecutor:
                 timestamp=time.time(),
             )
 
+    def prefetch_token(self, token_id: str) -> None:
+        """
+        Pre-fetch and cache tick_size, neg_risk, and fee_rate for a token.
+        Call this when a new window starts so orders don't incur 3 HTTP lookups.
+        """
+        if not self.client or token_id in self._token_cache:
+            return
+        try:
+            import httpx
+            base = "https://clob.polymarket.com"
+            with httpx.Client(timeout=5.0) as http:
+                ts_r = http.get(f"{base}/tick-size", params={"token_id": token_id})
+                nr_r = http.get(f"{base}/neg-risk", params={"token_id": token_id})
+                fr_r = http.get(f"{base}/fee-rate", params={"token_id": token_id})
+
+                tick = ts_r.json().get("minimum_tick_size", self.tick_size)
+                neg  = nr_r.json().get("neg_risk", False)
+                fee  = fr_r.json().get("fee_rate_bps", 0)
+
+            self._token_cache[token_id] = {
+                "tick_size": str(tick),
+                "neg_risk":  neg,
+                "fee_rate":  int(fee),
+            }
+            logger.info(f"Token cache set: {token_id[:12]}… tick={tick} neg={neg} fee={fee}bps")
+        except Exception as e:
+            logger.warning(f"prefetch_token failed for {token_id[:12]}: {e}")
+
     def place_market_order(
         self,
         token_id: str,
@@ -483,11 +570,8 @@ class LiveExecutor:
         Place a Fill-or-Kill market order.
         Executes immediately at best available price or cancels.
 
-        Args:
-            token_id: Polymarket token ID
-            side: "BUY" or "SELL"
-            amount: Dollar amount to spend
-            worst_price: Worst acceptable price (0 = any price)
+        worst_price: maximum acceptable price. Pass 0 to accept any price.
+        We deliberately do NOT use this as a hard cap — see note below.
         """
         if not self.client or not self.connected:
             return TradeResult(success=False, error="Not connected")
@@ -495,19 +579,33 @@ class LiveExecutor:
         t_start = time.perf_counter_ns()
 
         try:
+            # Resolve cached token metadata to skip 3 HTTP lookups per order.
+            meta = self._token_cache.get(token_id, {})
+            tick_size = meta.get("tick_size", self.tick_size)
+
             logger.info(f"Market order: {side} ${amount:.2f} | token={token_id[:12]}...")
 
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=amount,
                 side=side,
+                # Pass price=None → true market order (no resting limit).
+                # Caller should already account for slippage in worst_price.
                 price=worst_price if worst_price > 0 else None,
-                fee_rate_bps=0,
+                fee_rate_bps=meta.get("fee_rate", 0),
             )
 
-            options = PartialCreateOrderOptions(tick_size=self.tick_size)
+            options = PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=meta.get("neg_risk", None),
+            )
 
-            response = self.client.create_market_order(order_args, options)
+            # Step 1: create + sign the market order locally
+            signed_order = self.client.create_market_order(order_args, options)
+
+            # Step 2: POST it to the CLOB as FOK (Fill-or-Kill)
+            # Without this step the order is only signed locally and never submitted.
+            response = self.client.post_order(signed_order, OrderType.FOK)
 
             t_end = time.perf_counter_ns()
             latency_ms = (t_end - t_start) / 1e6
@@ -515,9 +613,21 @@ class LiveExecutor:
             self.total_orders += 1
             self.latencies_ms.append(latency_ms)
 
+            # Parse the server response dict
+            if isinstance(response, dict):
+                order_id   = response.get("orderID") or response.get("id") or ""
+                success    = bool(order_id) or response.get("success", False)
+                status_msg = response.get("status", "")
+                error_msg  = response.get("errorMsg", "")
+            else:
+                order_id  = str(response) if response else ""
+                success   = bool(response)
+                status_msg = ""
+                error_msg  = ""
+
             result = TradeResult(
-                success=bool(response),
-                order_id=str(response) if response else "",
+                success=success,
+                order_id=order_id,
                 token_id=token_id,
                 side=side,
                 price=worst_price,
@@ -525,14 +635,20 @@ class LiveExecutor:
                 cost=amount,
                 latency_ms=latency_ms,
                 timestamp=time.time(),
+                error=error_msg,
             )
 
-            if result.success:
+            if success:
                 self.successful_orders += 1
-                logger.info(f"MARKET ORDER OK | {side} ${amount:.2f} | Latency: {latency_ms:.1f}ms")
+                logger.info(
+                    f"MARKET ORDER OK | {side} ${amount:.2f} | "
+                    f"ID: {order_id} | Status: {status_msg} | Latency: {latency_ms:.1f}ms"
+                )
             else:
                 self.failed_orders += 1
-                logger.warning(f"MARKET ORDER FAILED | Response: {response}")
+                logger.warning(
+                    f"MARKET ORDER FAILED | Response: {response} | Error: {error_msg}"
+                )
 
             return result
 
@@ -560,6 +676,20 @@ class LiveExecutor:
         except Exception as e:
             logger.error(f"Cancel failed: {e}")
             return False
+
+    def get_balance_allowance(self) -> Tuple[float, float]:
+        """Fetch (balance_usd, allowance_usd) from Polymarket. Returns (0,0) on error."""
+        if not self.client:
+            return 0.0, 0.0
+        try:
+            bal_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self.client.get_balance_allowance(bal_params)
+            balance = int(result.get("balance", 0) or 0) / 1e6
+            allowance = int(result.get("allowance", 0) or 0) / 1e6
+            return balance, allowance
+        except Exception as e:
+            logger.warning(f"Balance fetch failed: {e}")
+            return 0.0, 0.0
 
     def get_open_orders(self) -> list:
         """Get all open orders."""

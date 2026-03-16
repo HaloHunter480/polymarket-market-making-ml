@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════
-# Polymarket HFT Bot - Server Deployment Script
+# Polymarket Empirical Bot - Server Deployment Script
 # ═══════════════════════════════════════════════════════════════════
 #
 # This script sets up the bot on a fresh Ubuntu server (AWS/VPS/etc).
@@ -12,7 +12,7 @@
 #
 # After setup, use tmux or systemd to keep it running:
 #   tmux new -s bot
-#   python3 btc_hft.py --bankroll=500
+#   python3 live_test_2usd.py
 #   (Ctrl+B, D to detach)
 #
 # ═══════════════════════════════════════════════════════════════════
@@ -20,7 +20,7 @@
 set -e
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Polymarket HFT Bot - Server Setup"
+echo "  Polymarket Empirical Bot - Server Setup"
 echo "═══════════════════════════════════════════════════════════════"
 
 # 1. System packages
@@ -73,20 +73,20 @@ avg = sum(lats) / len(lats)
 mn = min(lats)
 print(f'  Polymarket CLOB latency: {mn:.0f}ms (min), {avg:.0f}ms (avg)')
 
-# Ping Binance
+# Ping Coinbase (v6 price feed)
 session2 = requests.Session()
-session2.get('https://api.binance.com/api/v3/ping', timeout=10)
+session2.get('https://api.exchange.coinbase.com/', timeout=10)
 lats2 = []
 for _ in range(5):
     t0 = time.perf_counter()
-    session2.get('https://api.binance.com/api/v3/ping', timeout=10)
+    session2.get('https://api.exchange.coinbase.com/', timeout=10)
     t1 = time.perf_counter()
     lats2.append((t1 - t0) * 1000)
 
 avg2 = sum(lats2) / len(lats2)
 mn2 = min(lats2)
-print(f'  Binance API latency:     {mn2:.0f}ms (min), {avg2:.0f}ms (avg)')
-print(f'  Total round-trip budget:  ~{mn + mn2:.0f}ms')
+print(f'  Coinbase API latency:    {mn2:.0f}ms (min), {avg2:.0f}ms (avg)')
+print(f'  Total round-trip budget: ~{int(mn + mn2)}ms')
 "
 
 echo ""
@@ -95,14 +95,14 @@ echo "  Setup complete!"
 echo ""
 echo "  Run paper trading:"
 echo "    source venv/bin/activate"
-echo "    python3 btc_hft.py --bankroll=500"
+echo "    python3 professional_strategy.py --bankroll=500"
 echo ""
-echo "  Run live trading:"
-echo "    python3 live_executor.py --go-live --bankroll=500"
+echo "  Run live trading (v6, small size):"
+echo "    python3 live_test_2usd.py"
 echo ""
 echo "  Run in background (survives SSH disconnect):"
 echo "    tmux new -s bot"
-echo "    python3 btc_hft.py --bankroll=500"
+echo "    python3 live_test_2usd.py"
 echo "    # Press Ctrl+B, then D to detach"
 echo "    # tmux attach -t bot to reattach"
 echo "═══════════════════════════════════════════════════════════════"

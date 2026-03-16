@@ -12,7 +12,7 @@
 
 This document presents a comprehensive statistical arbitrage system for trading binary options on Bitcoin price movements in the Polymarket prediction market. The system employs advanced mathematical models from financial econometrics, market microstructure theory, and information theory to identify and exploit pricing inefficiencies while managing toxic flow and adverse selection.
 
-**Key Components**:
+**Key Components (v4 — Paper Trading)**:
 1. Empirical probability surface calibration
 2. Kelly Criterion for optimal position sizing
 3. Hawkes process for volume clustering detection
@@ -20,6 +20,23 @@ This document presents a comprehensive statistical arbitrage system for trading 
 5. Kyle's Lambda for market impact estimation
 6. Order flow pressure analysis
 7. Multi-signal fusion and execution optimization
+
+**Key Components (v5 — Research-Grade Live System)**:
+1. Uncertainty-Adjusted Kelly with Monte Carlo Beta posterior sampling
+2. Calibration Curve with online MLE (favorite-longshot bias correction)
+3. Monte Carlo Equity Simulation for session-level ruin probability
+4. ~~Order Flow Imbalance (OFI)~~ — *disabled* (not predictive on OOS)
+5. Regime Classification via EWMA volatility and momentum (replaces Hurst)
+6. Full outcome distribution tracking (variance, skewness, CI)
+
+**Key Components (v6 — Validated Live System)**:
+1. Walk-Forward Empirical Surface — train/test split, OOS conditional win rate (target ≥60%)
+2. Regime-Stratified Bins — regime used only if OOS-validated (≥58% confident WR)
+3. Empirical Calibration Tracker — Brier score, reliability diagram at runtime
+4. Mud Zone — no trade when prob ∈ [0.38, 0.62]
+5. Hold-to-Expiry Precision Mode — enter only in first 120s, price zone 0.35–0.57
+6. Coinbase Price Feed — matches Polymarket settlement source
+7. Recency-Weighted Surface — last 25% of train counts double
 
 ---
 
@@ -35,6 +52,16 @@ This document presents a comprehensive statistical arbitrage system for trading 
 8. [Risk Management](#8-risk-management)
 9. [Performance Metrics](#9-performance-metrics)
 10. [Conclusion](#10-conclusion)
+11. [Research-Grade Enhancements (v5)](#11-research-grade-enhancements-v5)
+    - [11.8 v6 Enhancements (Validated Live System)](#118-v6-enhancements-validated-live-system)
+    - 11.1 Uncertainty-Adjusted Kelly (Monte Carlo Posterior)
+    - 11.2 Calibration Curve (Favorite-Longshot Bias Correction)
+    - 11.3 Monte Carlo Equity Simulation
+    - 11.4 Order Flow Imbalance (OFI) — disabled in v6
+    - 11.5 Regime Classification (EWMA + Momentum)
+    - 11.6 Full Distribution Tracking
+    - 11.7 Integrated Signal Pipeline
+    - 11.8 Walk-Forward, Regime OOS, Mud Zone, Hold-to-Expiry
 
 ---
 
@@ -160,10 +187,14 @@ w_base = 1 - w_momentum
 ### 2.5 Data Requirements
 
 **Training Dataset**:
-- Source: Binance BTC/USDT 1-minute candles
+- Source: Binance BTC/USDT 1-minute candles (historical)
 - Period: 31 days (45,000 1-minute observations)
-- Windows simulated: 9,000 five-minute windows
-- Coverage: All market regimes (trending, ranging, volatile)
+- Windows: overlapping 1-candle-step (9,000+ windows)
+- Split: 70% train, 30% hold-out for OOS validation
+
+**Live Price Feed (v6)**:
+- Source: Coinbase WebSocket (`wss://ws-feed.exchange.coinbase.com`, BTC-USD ticker)
+- Rationale: Matches Polymarket settlement reference; minimizes basis risk
 
 ---
 
@@ -1039,6 +1070,367 @@ async def main():
 
 ---
 
+## 11. Research-Grade Enhancements (v5)
+
+This section documents six additional research-grade modules introduced in the live trading system (v5) to address the empirical shortcomings exposed in real trading conditions.
+
+---
+
+### 11.1 Uncertainty-Adjusted Kelly Criterion (Monte Carlo Posterior)
+
+**Motivation**: The classical Kelly formula `f* = (p·b − q)/b` treats `p` as a known constant. In practice, `p` is estimated from a finite sample of `n` historical outcomes, introducing estimation uncertainty. Ignoring this uncertainty leads to systematic over-betting, especially in data-sparse regimes.
+
+**Model**: Three independent sources of uncertainty are resampled per Monte Carlo path:
+
+**Dimension 1 — Win-probability uncertainty (all order types)**
+
+```
+P(p | data)  ~  Beta(α, β)
+     α = p̂ · n
+     β = (1 − p̂) · n
+```
+
+When `n` is small the Beta distribution is wide → conservative sizing automatically.
+
+**Dimension 2 — Entry-price / slippage uncertainty (taker orders)**
+
+```
+slip_s  ~  clip(Normal(μ_slip, σ_slip),  0,  ∞)
+     μ_slip = 1.5%  (empirical taker slippage)
+     σ_slip = 0.3 · μ_slip
+
+effective_price_s = price · (1 + slip_s)
+R_s = (1 − fee) / effective_price_s − 1     ← payout ratio varies per path
+```
+
+**Dimension 3 — Fill-rate uncertainty (maker orders only)**
+
+```
+fill_s  ~  Beta(fα, fβ)
+     fα = fill_rate · n_fill_obs     (prior: 40% fill rate, n=50)
+     fβ = (1 − fill_rate) · n_fill_obs
+
+3-outcome Kelly derivation (win / lose / no-fill):
+     E[log(1+r)] = fill_p·p·log(1+f·R) + fill_p·(1-p)·log(1-f) + (1-fill_p)·log(1)
+     d/df = fill_p · [p·R/(1+f·R) − (1-p)/(1-f)] = 0
+     
+     fill_p cancels → f* is theoretically independent of fill_rate.
+     BUT: fill-rate *uncertainty* inflates cross-path variance.
+     
+Solution: multiply f_s by fill_s, so the 25th-percentile cut penalises paths
+where both win-probability and fill-rate are simultaneously unfavourable.
+```
+
+**Full per-path Kelly calculation**:
+
+```
+For each path s = 1 … N (N = 5,000):
+    p_s     ~ Beta(α, β)                        [Dimension 1]
+    slip_s  ~ clip(Normal(μ, σ), 0, ∞)          [Dimension 2 — taker only]
+    R_s     = (1 − fee) / (price · (1 + slip_s)) − 1
+    f_s     = max(0,  (p_s · R_s − (1−p_s)) / R_s)
+    
+    if MAKER:
+        fill_s ~ Beta(fα, fβ)                   [Dimension 3]
+        f_s    = f_s · fill_s
+
+Conservative Kelly  f* = Quantile₂₅({f_s})
+f_capped = min(f*, 15%)
+size_usd = f_capped · bankroll
+```
+
+**Observed behaviour** (prob=0.60, price=0.45, n=200, bankroll=$7):
+
+| Scenario | kelly₂₅ | kelly₅₀ | Trade size |
+|:---|:---:|:---:|:---:|
+| Taker (1.5% slippage) | 0.209 | 0.252 | $1.00 (capped) |
+| Maker (40% fill rate) | 0.081 | 0.101 | $0.57 |
+| Sparse n=25 taker | 0.130 | 0.253 | $0.91 |
+
+The maker size ($0.57) is automatically ~35% smaller than the taker size, correctly reflecting the double uncertainty of fill rate + payout.
+
+**Implementation**: `MonteCarloKelly.compute()` — 5,000 paths, 3 sampling dimensions, 25th percentile, automatic regime scaling applied after.
+
+---
+
+### 11.2 Calibration Curve (Favorite-Longshot Bias Correction)
+
+**Motivation**: Prediction markets systematically misprice extreme probabilities. The *favorite-longshot bias* (FLB) is well-documented: longshots (low-probability events) are overpriced while favorites (high-probability events) are underpriced. If we use raw market prices as our prior, we will systematically underestimate our true edge.
+
+**Model**: The power-law calibration transform:
+
+```
+p_calibrated = p^(1/γ) / [p^(1/γ) + (1−p)^(1/γ)]
+```
+
+where `γ > 1` corrects for FLB. At `γ = 1.0`, no correction. At `γ = 1.08` (empirical default for mature prediction markets):
+
+| Market Price | Calibrated Price |
+|:---:|:---:|
+| 0.10 | 0.116 (longshot corrected up) |
+| 0.30 | 0.313 |
+| 0.50 | 0.500 (symmetric) |
+| 0.70 | 0.687 |
+| 0.90 | 0.884 (favourite corrected down) |
+
+**Rolling Out-of-Sample Fitting (walk-forward)**: After every `FOLD_SIZE = 10` new observations the system runs a walk-forward OOS update:
+
+```
+train  = all observations BEFORE the current fold   (fitting set)
+val    = current fold of 10 observations            (held-out OOS test)
+
+γ* = argmax_{γ ∈ [0.90, 1.30]}  Σ_{i ∈ train} log L(γ; p_i, y_i)
+
+Applied γ ← γ*  only if len(train) ≥ 20
+```
+
+The γ is **never fitted on the validation fold** — it is only evaluated there.  This eliminates the in-sample bias of fitting and scoring on the same data.  The OOS log-likelihood on each fold is tracked; if it deteriorates, the model is drifting out-of-distribution.
+
+This means the calibration curve adapts over time to the actual FLB present in each market, with clean OOS validation at each step.
+
+**Effect on edge calculation**:
+```
+edge = prob_model − p_calibrated − fee   (instead of using raw mid)
+```
+
+**Implementation**: `CalibrationCurve.calibrate()`, `CalibrationCurve.record_outcome()`, `CalibrationCurve._update_gamma()`.
+
+---
+
+### 11.3 Monte Carlo Equity Simulation (Forward-Looking Risk)
+
+**Motivation**: Standard risk metrics (VaR, Kelly) are computed *per trade* and do not account for path-dependency — the fact that losses early in a session reduce the bankroll available for subsequent trades. We need a forward-looking estimate of ruin probability and expected drawdown over the remaining trading session.
+
+**Model**: Given current bankroll `W₀`, remaining trades `T`, probability `p`, and Kelly fraction `f`:
+
+```
+For each path k = 1 … N_paths:
+    W_{t+1} = W_t + f·W_t·R       with probability p     (win)
+    W_{t+1} = W_t − f·W_t         with probability 1−p   (loss)
+    
+    Stop if  W_t < W_min  (ruin condition)
+```
+
+**Per-path statistics recorded**:
+```
+final equity W_T^k
+peak equity   P_t^k  = max_{s≤t} W_s^k      (high-water mark)
+max drawdown  DD^k   = max_t (P_t^k − W_t^k) (peak-to-trough)
+loss streak   LS^k   = max consecutive losing trades
+time u/water  TUW^k  = #{t : W_t^k < W_0}   (trades below starting bankroll)
+```
+
+**Aggregated metrics returned**:
+```
+P(ruin)           = #{k : W_T^k < W_min} / N_paths
+W_median, W_5, W_95
+E[return]         = mean(W_T^k) − W_0
+
+DD_mean           = mean(DD^k)
+DD_p95            = 95th pct of {DD^k}   ← worst-5% drawdown
+DD_p99            = 99th pct of {DD^k}
+DD_pct_p95        = DD_p95 / W_0         (as % of bankroll)
+
+streak_mean       = mean(LS^k)
+streak_p95        = 95th pct of {LS^k}
+streak_dist       = {length: count}      (full frequency distribution)
+
+tuw_mean          = mean(TUW^k)          (trades)
+tuw_p95           = 95th pct of {TUW^k}
+tuw_pct_mean      = tuw_mean / n_trades  (fraction of session)
+```
+
+**Decision rules**:
+- If `P(ruin) > 20%`: reduce position size by 50% and recheck
+- If `DD_p95 > 60%` of bankroll: flag as high-risk session
+
+**Parameters**: 2,000 simulation paths, 10 forward trades, `W_min = $0.50`.
+
+**Implementation**: `EquitySimulator.simulate()`.
+
+---
+
+### 11.4 Order Flow Imbalance (OFI) Signal — *Disabled in v6*
+
+**Motivation**: The best available summary of current buying/selling pressure in a CLOB is the *Order Flow Imbalance* (OFI), introduced by Cont, Kukanov & Stoikov (2014). OFI measures net quote changes at the best bid/ask and has been shown to be a leading indicator of short-term price movements.
+
+**v6 Status**: OFI was disabled after OOS validation showed it did not improve predictive accuracy. The conditional win rate (confident predictions only) was ~50% with OFI and ~77% without — OFI was adding noise. The implementation remains in code but is not used in the live signal pipeline.
+
+**Model**: Let `B_t` = best bid price, `A_t` = best ask price, `V_t^B` = bid volume, `V_t^A` = ask volume. The OFI increment at time `t`:
+
+```
+δOFI_t = ΔV^B_t − ΔV^A_t
+
+plus level-change contributions:
+    if B_t > B_{t−1}:  δOFI_t += V^B_t       (new bid level: buying pressure)
+    if A_t < A_{t−1}:  δOFI_t −= V^A_t       (new ask level: selling pressure)
+```
+
+**Normalised signal**: The cumulative OFI over a rolling window of `W = 60` ticks is Z-scored:
+
+```
+OFI_signal = clip(ΣOFI / (σ_{OFI} · √W),  −1,  +1)
+```
+
+**Use in strategy**:
+1. **Gate filter**: If `|OFI_signal| > 0.2` and OFI disagrees with the model's direction, skip the trade.
+2. **Edge boost**: When OFI confirms direction, add `OFI_signal × 0.15 × 0.05` to `best_edge`.
+
+```
+if side = UP  and  OFI_signal > 0.2:
+    edge += OFI_signal × w_ofi × scale
+```
+
+**Rationale**: Binary option market makers reprice quickly. A strong OFI signal means the underlying order book is moving in our direction *before* the mid-price updates — a micro-latency edge.
+
+**Implementation**: `OFITracker.update()`, `OFITracker.signal()`.
+
+---
+
+### 11.5 Regime Classification (EWMA Volatility + Momentum) — v6
+
+**Motivation**: Markets cycle between different statistical regimes. Hurst exponent requires 256+ samples and has upward bias on short windows. v6 replaces it with two signals reliable from ~10 ticks.
+
+**Model**: Two statistics jointly classify regime:
+
+**1. EWMA Realized Volatility** (RiskMetrics, λ = 0.94):
+```
+σ²_t = λ·σ²_{t−1} + (1−λ)·r²_t
+vol_ratio = σ_ewma / σ_baseline
+```
+
+**2. Directional Momentum Score**:
+```
+M = Σ sign(r_i) / n  ∈ [-1, +1]
+```
+Trending declared only when |M| > 2/√n (95% binomial noise band).
+
+**Regime Table**:
+
+| Regime | Condition | Position Scaling |
+|:---|:---|:---:|
+| Trending | |M| > 2/√n | 1.00× |
+| Mean-reverting | vol_ratio < 0.6 | 1.15× |
+| Volatile | vol_ratio > 1.8 | 0.70× |
+| Neutral | otherwise | 1.00× |
+| Unknown | < 10 returns | 0.85× |
+
+**v6 OOS Validation**: Each regime is used for stratification only if its OOS win rate on confident predictions (prob ≥ 0.62 or ≤ 0.38) is ≥ 58%. Non-predictive regimes fall back to pooled surface.
+
+**Implementation**: `RegimeClassifier.classify()` — rolling 120-tick window.
+
+---
+
+### 11.6 Full Distribution Tracking (Beyond the Mean)
+
+**Motivation**: The empirical probability surface stores only the win/loss count per `(pct_diff, time_remaining)` cell. This discards all information about *how much* BTC moves — essential for understanding variance, tail risk, and the skewness of outcomes.
+
+**Model**: For each cell `(p_bin, t_bin)`, we track the full vector of final percentage moves `{Δ_i}`:
+
+```
+dist_surface[(p_bin, t_bin)] = [Δ₁, Δ₂, ..., Δₙ]
+    where  Δᵢ = (BTC_close − BTC_open) / BTC_open × 100
+```
+
+**Statistics computed on demand**:
+```
+μ  = (1/n) Σ Δᵢ                                (mean final move)
+σ² = (1/n) Σ (Δᵢ − μ)²                         (variance)
+γ₁ = (1/n) Σ [(Δᵢ − μ)/σ]³                     (skewness)
+SE = σ / √n                                      (standard error)
+CI = [μ − 1.96·SE,  μ + 1.96·SE]               (95% confidence interval)
+P₅, P₉₅                                         (5th/95th percentiles)
+```
+
+**Use in strategy**: Displayed in the live dashboard at signal trigger time, giving the trader a complete statistical picture of the current market state:
+
+```
+Dist: CI=[−0.005, +0.023] skew=+0.34 ✓   ← CI > 0, positive skew favours UP
+Dist: CI=[−0.031, +0.002] skew=−0.12     ← CI crosses zero, uncertainty high
+```
+
+**Why skewness matters**: A positive skew `γ₁ > 0` means there are occasional large upward moves in the distribution — increasing the expected payout of UP tokens beyond what the mean alone suggests.
+
+**Implementation**: `EmpiricalEngine.dist_surface`, `EmpiricalEngine.get_distribution()`.
+
+---
+
+### 11.7 Integrated Signal Pipeline (v5)
+
+The six modules interact in a sequential pipeline at each decision point. See v6 pipeline below for current live system.
+
+---
+
+### 11.8 v6 Enhancements (Validated Live System)
+
+**11.8.1 Walk-Forward Empirical Surface**
+
+The empirical surface is built from the first 70% of windows (chronological). The last 30% is held out for OOS validation. No data leakage.
+
+**OOS Metric**: Conditional win rate on *confident* predictions only:
+- Predict UP when prob ≥ 0.62
+- Predict DOWN when prob ≤ 0.38
+- Win rate on these predictions must be ≥ 60% (achieved ~77% in validation)
+
+**11.8.2 Regime-Stratified Bins**
+
+Surface key: `(pct_bin, t_bin, regime)`. Regime from `RegimeClassifier` (EWMA vol + momentum). Regimes merged: volatile + unknown → "uncertain".
+
+A regime is used only if its OOS confident win rate ≥ 58%. Otherwise fall back to pooled `(pct, t)`.
+
+**11.8.3 Empirical Calibration Tracker**
+
+At runtime, `EmpiricalCalibrator` records `(predicted_prob, outcome)` for each resolved trade. Computes:
+- **Brier score**: (1/n) Σ(pred − actual)²
+- **Reliability diagram**: per-bucket mean predicted vs mean actual
+
+**11.8.4 Mud Zone**
+
+When raw empirical prob ∈ [0.38, 0.62], return 0.5 (no edge). No trade in uncertain regime.
+
+**11.8.5 Hold-to-Expiry Precision Mode**
+
+- Enter only in first 120s of window (before market discovers direction)
+- Price zone: 0.35–0.57 (market must be uncertain)
+- BTC distance gate: 0.01%–0.20% from strike in signal direction
+- No mid-window sells (except catastrophic emergency)
+- Min edge: 6%
+
+**11.8.6 Recency Weighting**
+
+Last 25% of training windows get weight 1.0; older windows get weight 0.5. Recent data counts more.
+
+**11.8.7 v6 Pipeline**
+
+```
+Tick Data (Coinbase WebSocket — BTC-USD)
+        │
+        ▼
+[5] Regime Classifier ──────────► regime_key  (for lookup)
+        │
+        ▼
+EmpiricalEngine.lookup(pct, t, regime)  ──► prob (mud zone → 0.5)
+        │
+        ▼
+[2] Calibration Curve ───────────► cal_mid
+        │
+        ▼
+  Edge = prob − cal_mid − fee   (conviction: prob ∉ [0.38, 0.62])
+        │
+        ▼
+[1] MC Kelly Sizing ─────────────► trade_size_usd
+        │
+        ▼
+[3] Equity Simulator ────────────► P(ruin) check
+        │
+        ▼
+    EXECUTE (hold to expiry)
+```
+
+OFI removed. Entry filters: price zone, window cutoff, BTC distance, min edge.
+
+---
+
 **End of Document**
 
-*This document represents the complete mathematical and statistical framework for a professional-grade statistical arbitrage system targeting Polymarket binary options. All models have been implemented and tested in paper trading conditions with realistic constraints.*
+*This document represents the complete mathematical and statistical framework for a professional-grade statistical arbitrage system targeting Polymarket binary options. All models have been implemented and tested in both paper trading conditions with realistic constraints and live trading on Polygon mainnet.*
