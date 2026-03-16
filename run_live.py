@@ -1091,12 +1091,14 @@ async def eval_loop(
 
         if n % EMIT_EVERY_N == 0:
             pct_diff = (state.btc_price - state.strike) / state.strike * 100
+            ml_tag = f" ml={sig.ml_p_up:.3f}" if sig.ml_p_up > 0 else ""
             log.info(
                 "T-%.0fs | btc=%.2f diff=%+.3f%% move10s=%+.3f%% | "
-                "fair=%.3f p_mkt=%.3f edge_net=%+.3f | "
+                "fair=%.3f(g=%.3f m=%.3f%s) p_mkt=%.3f edge_net=%+.3f | "
                 "vpin=%.3f hawkes=%s vol=%s hmm=%s | %s",
                 seconds_remaining(), state.btc_price, pct_diff, sig.btc_move_10s,
-                sig.fair_value, sig.p_market, sig.edge_net,
+                sig.fair_value, sig.merton_p_up or sig.fair_value, sig.merton_p_up or 0.0, ml_tag,
+                sig.p_market, sig.edge_net,
                 sig.vpin, sig.hawkes_regime, sig.vol_regime, sig.hmm_regime or "-",
                 sig.action if sig.action != "WAIT" else f"WAIT({sig.veto_reason})",
             )
@@ -1131,11 +1133,11 @@ async def eval_loop(
         shares      = round(size_usd / entry_price, 2)
 
         log.info(
-            "⚡ SIGNAL: %s | fair=%.3f p_mkt=%.3f edge_net=%+.3f "
-            "size=$%.2f @%.3f | mult=%.2f | vpin=%.3f hawkes=%s hmm=%s",
+            "⚡ SIGNAL: %s | fair=%.3f [gauss+merton+ML] p_mkt=%.3f edge_net=%+.3f "
+            "size=$%.2f @%.3f | mult=%.2f | vpin=%.3f hawkes=%s hmm=%s ml=%.3f",
             sig.side, sig.fair_value, sig.p_market, sig.edge_net,
             size_usd, entry_price, sig.size_multiplier, sig.vpin, sig.hawkes_regime,
-            sig.hmm_regime or "-",
+            sig.hmm_regime or "-", sig.ml_p_up,
         )
 
         # ── 10. execute ──────────────────────────────────────────────────────

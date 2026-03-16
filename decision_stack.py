@@ -95,8 +95,9 @@ class MarketState:
 class SignalResult:
     action:          str   = "WAIT"     # TRADE | WAIT | HALT
     side:            str   = ""         # UP | DOWN
-    fair_value:      float = 0.5        # Gaussian fair value for UP token
+    fair_value:      float = 0.5        # Blended fair value for UP token
     merton_p_up:     float = 0.0        # Layer 4: Merton jump-diffusion P(UP); 0=not computed
+    ml_p_up:         float = 0.0        # ML ensemble P(UP); 0=not computed
     p_market:        float = 0.5        # Polymarket mid at signal time
     edge_raw:        float = 0.0        # fair_value - p_market (before fee)
     edge_net:        float = 0.0        # after TOTAL_COST
@@ -134,9 +135,13 @@ class DecisionStack:
         self._n_ticks:    int   = 0
 
         # Track recent Polymarket mid to detect if quote already repriced
-        self._poly_mid_history: deque = deque(maxlen=60)  # (ts, mid) pairs
-        # Price history for Layer 5 HMM regime
-        self._btc_price_history: deque = deque(maxlen=300)  # (ts, price)
+        self._poly_mid_history: deque = deque(maxlen=60)   # (ts, mid) pairs
+        # Price history for Layer 5 HMM regime + ML feature construction
+        self._btc_price_history: deque = deque(maxlen=600)  # (ts, price) — 5-10 min @ 1-2 ticks/s
+
+        # ML ensemble (Logistic + HistGBM + XGBoost) — lazy loaded
+        self._ml_ensemble = None
+        self._ml_ensemble_tried: bool = False
         self._hmm_regime = None  # Layer5HMMRegime, lazy init
         self._regime_history: deque = deque(maxlen=REGIME_MODE_WINDOW)  # mode filter
         self._prev_regime: str = ""
@@ -160,6 +165,81 @@ class DecisionStack:
             except Exception:
                 pass
         return self._hmm_regime
+
+    def _get_ml_ensemble(self):
+        """Lazy-load the trained 3-model ensemble (Logistic + HistGBM + XGBoost)."""
+        if self._ml_ensemble_tried:
+            return self._ml_ensemble
+        self._ml_ensemble_tried = True
+        try:
+            import pickle, os
+            path = os.path.join(os.path.dirname(__file__), "models", "probability_model.pkl")
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    self._ml_ensemble = pickle.load(f)
+                log.info("ML ensemble loaded (Logistic + HistGBM + XGBoost)")
+            else:
+                log.warning("ML ensemble not found at %s — run train_probability_model.py first", path)
+        except Exception as e:
+            log.warning("ML ensemble load error: %s", e)
+        return self._ml_ensemble
+
+    def _build_ml_features(self, state: MarketState) -> np.ndarray:
+        """
+        Build the 13-feature vector that matches train_probability_model.compute_features():
+          [ret_1s, ret_10s, ret_30s, ret_60s, ret_120s,
+           realized_vol_60s, realized_vol_10s, vol_30s, vol_120s,
+           ofi, spread_pct, dist_strike, time_to_expiry]
+        """
+        now   = state.timestamp or time.time()
+        price = state.btc_price
+        hist  = list(self._btc_price_history)  # [(ts, price)], oldest first
+
+        def _price_ago(seconds: float) -> float:
+            cutoff = now - seconds
+            for ts, p in reversed(hist):
+                if ts <= cutoff:
+                    return p
+            return hist[0][1] if hist else price
+
+        def _rvol(seconds: float) -> float:
+            cutoff = now - seconds
+            prices = [p for ts, p in hist if ts >= cutoff]
+            if len(prices) < 3:
+                return 0.05
+            return float(np.std(np.diff(np.log(np.array(prices) + 1e-12))) * 100)
+
+        p1   = _price_ago(1.0)
+        p10  = _price_ago(10.0)
+        p30  = _price_ago(30.0)
+        p60  = _price_ago(60.0)
+        p120 = _price_ago(120.0)
+
+        ret_1s   = (price / p1   - 1) * 100 if p1   > 0 else 0.0
+        ret_10s  = (price / p10  - 1) * 100 if p10  > 0 else 0.0
+        ret_30s  = (price / p30  - 1) * 100 if p30  > 0 else 0.0
+        ret_60s  = (price / p60  - 1) * 100 if p60  > 0 else 0.0
+        ret_120s = (price / p120 - 1) * 100 if p120 > 0 else 0.0
+
+        # OFI proxy: use Polymarket OBI when live, else Binance book
+        if state.poly_bid_vol + state.poly_ask_vol > 0:
+            ofi = state.poly_obi
+        else:
+            ofi = self.ob.order_book_imbalance(levels=5)
+
+        # Spread proxy from Binance depth
+        try:
+            spread_pct = float(self.ob.spread_ratio) * 100
+        except Exception:
+            spread_pct = 0.0
+
+        dist_strike = (price - state.strike) / state.strike * 100 if state.strike > 0 else 0.0
+
+        return np.array([[
+            ret_1s, ret_10s, ret_30s, ret_60s, ret_120s,
+            _rvol(60.0), _rvol(10.0), _rvol(30.0), _rvol(120.0),
+            ofi, spread_pct, dist_strike, state.time_remaining,
+        ]], dtype=np.float64)
 
     # ── feed methods ───────────────────────────────────────────────────────────
 
@@ -297,23 +377,38 @@ class DecisionStack:
                 res.veto_reason = "layer6_no_trade"
                 return res
         else:
-            pct_diff = (state.btc_price - state.strike) / state.strike * 100
-            fv       = self.compute_fair_value(pct_diff, state.time_remaining)
-            fair_up  = fv["fair_value"]
-            sigma_t  = fv["sigma_t"]
+            pct_diff        = (state.btc_price - state.strike) / state.strike * 100
+            fv              = self.compute_fair_value(pct_diff, state.time_remaining)
+            gaussian_fair_up = fv["fair_value"]
+            sigma_t         = fv["sigma_t"]
 
             # Layer 4: Merton jump-diffusion (second signal)
+            merton_p = None
             try:
                 from layer4_merton_jump import Layer4MertonEngine
-                merton = Layer4MertonEngine()
+                merton   = Layer4MertonEngine()
                 merton_p = merton.evaluate_standalone(
                     state.btc_price, state.strike, state.time_remaining,
                     sigma_5m_pct=fv.get("sigma_5m", 0.24),
                 )
                 res.merton_p_up = merton_p
-                fair_up = 0.5 * fair_up + 0.5 * merton_p
             except Exception:
                 pass
+
+            # ML ensemble: Logistic Regression + HistGradientBoosting + XGBoost
+            ml_p = None
+            try:
+                ml_model = self._get_ml_ensemble()
+                if ml_model is not None:
+                    X_feat = self._build_ml_features(state)
+                    ml_p   = float(ml_model.predict_proba(X_feat)[0, 1])
+                    res.ml_p_up = ml_p
+            except Exception:
+                pass
+
+            # Blend: equal thirds for all three available signals
+            signals = [s for s in [gaussian_fair_up, merton_p, ml_p] if s is not None]
+            fair_up = sum(signals) / len(signals)
 
             res.fair_value = fair_up
             res.pct_diff   = round(pct_diff, 4)
