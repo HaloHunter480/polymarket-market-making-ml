@@ -1,3 +1,4 @@
+
 # Polymarket BTC Latency-Arbitrage — Market-Taking Bot
 
 A live, real-money trading system that exploits **stale quotes on Polymarket BTC 5-minute binary options** using a 6-layer probabilistic signal architecture, deployed on AWS eu-west-1 (Ireland, ~140ms to Polymarket CLOB).
