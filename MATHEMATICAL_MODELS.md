@@ -1434,3 +1434,4 @@ OFI removed. Entry filters: price zone, window cutoff, BTC distance, min edge.
 **End of Document**
 
 *This document represents the complete mathematical and statistical framework for a professional-grade statistical arbitrage system targeting Polymarket binary options. All models have been implemented and tested in both paper trading conditions with realistic constraints and live trading on Polygon mainnet.*
+# Layer 1-6 Pipeline: Key Design Decisions and Trade-offs
