@@ -71,3 +71,4 @@ python3 live_test_2usd.py
 ```
 
 Logs → `logs/live_YYYYMMDD_HHMMSS.jsonl`
+# STRIKE_LOCK_S extended to 150s, OBI gate neutral default, EXPLOSIVE regime
