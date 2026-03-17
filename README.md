@@ -1,4 +1,4 @@
-# Polymarket BTC 5-Min Latency-Arbitrage Bot
+# Latency Arbitrage Engine for Prediction Markets
 
 ⚠️ Research/educational project. Not financial advice or production-ready trading system.
 
