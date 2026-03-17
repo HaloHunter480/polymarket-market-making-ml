@@ -1,11 +1,12 @@
 # Polymarket BTC 5-Min Latency-Arbitrage Bot
 
+⚠️ Research/educational project. Not financial advice or production-ready trading system.
+
 > **Market-taking system** that exploits stale quotes on Polymarket BTC binary options.  
 > When BTC moves on Binance, Polymarket's CLOB takes 2–5 seconds to reprice.  
-> We compute fair value faster and hit the stale side before it updates.
+> The system estimates short-term fair value and attempts to exploit latency-driven mispricings.
 
-**Live confirmed order:** `0xdc9ff92dd273d60348ff0d53dfe6d040f92de07bec2cfce804dfd1189c252fba`  
-**Deployed on:** AWS EC2 eu-west-1 (Ireland) — ~140ms round-trip to Polymarket CLOB  
+**Deployed on:** AWS EC2 eu-west-1 (Ireland) — ~140ms round-trip latency observed (AWS eu-west-1)
 **Language:** Python 3.12 · asyncio · fully event-driven
 
 ---
@@ -177,18 +178,15 @@ Threshold 0.55 → informed-flow regime → halt trading
 
 ---
 
-## Live Results
+## Limitations
 
-| Window (ET) | Side | Entry | Edge | Result | P&L |
-|-------------|------|-------|------|--------|-----|
-| 10:20–10:25 | DOWN | 0.570 | +15.3% | **WIN** | +$1.29 |
-| 10:30–10:35 | DOWN | 0.740 | +7.6% | **WIN** | +$0.34 |
-| 10:55–11:00 | DOWN | 0.570 | +13.8% | matched | — |
-
-**Balance:** $20.00 → $20.68 after 2 resolved trades.
+- No strict out-of-sample validation; results may not generalize.
+- Strategy depends on short-lived latency inefficiencies.
+- Execution assumptions (fills, slippage) are simplified.
+- Regime detection may lag during rapid market shifts.
 
 ---
-
+  
 ## Setup & Run
 
 ```bash
